@@ -1,6 +1,13 @@
 ---
-title: Welcome to Quartz
+title: 个人笔记
 ---
 
-This is a blank Quartz installation.
-See the [documentation](https://quartz.jzhao.xyz) for how to get started.
+- [[八股/QT]]
+- [[八股/mysql]]
+- [[八股/小组件]]
+- [[八股/算法题]]
+- [[八股/八股问答]]
+- [[八股/操作系统八股]]
+- [[八股/网络八股]]
+- [[八股/音视频]]
+- [[八股/模拟面试（视频）]]
