@@ -388,13 +388,23 @@ input[type="checkbox"] {
   }
 }
 
+// blockquote {
+//   margin: 1rem 0;
+//   padding: 0.75rem 1rem;
+//   border: 1px solid var(--lightgray);
+//   border-radius: 0.4rem;
+//   background-color: var(--highlight);
+//   color: var(--darkgray);
+// }
 blockquote {
   margin: 1rem 0;
-  border-left: 3px solid var(--secondary);
-  padding-left: 1rem;
-  transition: border-color 0.2s ease;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--lightgray);
+  border-left: none;
+  border-radius: 0.4rem;
+  background-color: var(--highlight);
+  color: var(--darkgray);
 }
-
 h1,
 h2,
 h3,
