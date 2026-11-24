@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="830" viewBox="0 0 1200 830" role="img" aria-labelledby="title desc">
+  <title id="title">ClientStream 主窗口 QGridLayout 布局示意图</title>
+  <desc id="desc">固定大小 800 乘 540 的窗口。左侧导航占两行，右侧标题栏在第一行，主页面容器在第二行。</desc>
+  <defs>
+    <style>
+      text { font-family: "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; }
+      .muted { fill: #64748b; }
+      .label { font-size: 16px; font-weight: 600; }
+      .small { font-size: 14px; }
+      .code { font-family: Consolas, "Microsoft YaHei", monospace; }
+    </style>
+  </defs>
+  <rect width="1200" height="830" fill="#f4f7fb" />
+  <text x="64" y="58" font-size="30" font-weight="700" fill="#172033">ClientStream 主窗口布局</text>
+  <text x="64" y="91" font-size="16" fill="#64748b">QGridLayout：左侧导航跨两行，右侧标题栏与主页面上下排列</text>
+  <rect x="900" y="39" width="236" height="42" rx="21" fill="#e7edf5" />
+  <text x="1018" y="66" text-anchor="middle" font-size="15" font-weight="600" fill="#334155">窗体固定尺寸 800 × 540 px</text>
+
+  <text x="250" y="131" text-anchor="middle" class="small muted">第 0 列</text>
+  <text x="730" y="131" text-anchor="middle" class="small muted">第 1、2 列（控件跨两列）</text>
+  <text x="108" y="169" text-anchor="end" class="small muted">第 0 行</text>
+  <text x="108" y="508" text-anchor="end" class="small muted">第 1 行</text>
+
+  <rect x="130" y="145" width="960" height="648" rx="12" fill="#ffffff" stroke="#b9c6d8" stroke-width="2" />
+  <path d="M142 145 H358 V793 H142 Q130 793 130 781 V157 Q130 145 142 145 Z" fill="#202a3a" />
+  <rect x="370" y="145" width="720" height="36" fill="#dbeafe" />
+  <rect x="370" y="181" width="720" height="612" fill="#eaf0f7" />
+  <path d="M370 181 H1090" stroke="#b9c6d8" stroke-width="1" />
+
+  <text x="158" y="208" font-size="20" font-weight="700" fill="#ffffff">listWgt_</text>
+  <text x="158" y="235" class="small" fill="#cbd5e1">左侧导航</text>
+  <rect x="154" y="260" width="192" height="1" fill="#475569" />
+  <circle cx="169" cy="298" r="5" fill="#60a5fa" />
+  <text x="187" y="304" font-size="15" fill="#f8fafc">用户入口</text>
+  <circle cx="169" cy="348" r="5" fill="#94a3b8" />
+  <text x="187" y="354" font-size="15" fill="#e2e8f0">远程控制</text>
+  <circle cx="169" cy="394" r="5" fill="#94a3b8" />
+  <text x="187" y="400" font-size="15" fill="#e2e8f0">设备设置</text>
+  <circle cx="169" cy="440" r="5" fill="#94a3b8" />
+  <text x="187" y="446" font-size="15" fill="#e2e8f0">高级设置</text>
+  <circle cx="169" cy="486" r="5" fill="#94a3b8" />
+  <text x="187" y="492" font-size="15" fill="#e2e8f0">演播室</text>
+  <rect x="151" y="704" width="198" height="64" rx="10" fill="#2b374a" />
+  <text x="250" y="729" text-anchor="middle" class="small" fill="#dbeafe">(row=0, col=0)</text>
+  <text x="250" y="752" text-anchor="middle" class="small" fill="#dbeafe">跨 2 行 × 1 列 · 200 × 540</text>
+
+  <text x="397" y="169" font-size="16" font-weight="700" fill="#1e3a5f">titleWgt_  ·  标题栏</text>
+  <text x="1066" y="169" text-anchor="end" class="small" fill="#47627f">(0,1) · 跨 1 行 × 2 列 · 600 × 30</text>
+
+  <rect x="414" y="255" width="632" height="464" rx="18" fill="#ffffff" stroke="#d5deea" stroke-width="2" />
+  <rect x="454" y="292" width="552" height="54" rx="12" fill="#eef4ff" />
+  <text x="480" y="326" font-size="17" font-weight="700" fill="#24466f">MainWgt_</text>
+  <text x="980" y="326" text-anchor="end" class="small" fill="#64748b">主页面容器 · 600 × 510</text>
+  <rect x="477" y="379" width="506" height="222" rx="14" fill="#f8fafc" stroke="#94a3b8" stroke-width="2" stroke-dasharray="8 7" />
+  <text x="730" y="438" text-anchor="middle" font-size="22" font-weight="700" fill="#334155">QStackedWidget</text>
+  <text x="730" y="472" text-anchor="middle" font-size="16" fill="#64748b">当前选中的页面显示在这里</text>
+  <rect x="537" y="506" width="386" height="54" rx="27" fill="#e0e7ff" />
+  <text x="730" y="540" text-anchor="middle" class="code" font-size="15" fill="#3730a3">setCurrentWidget(当前页面)</text>
+  <text x="730" y="654" text-anchor="middle" class="small muted">(row=1, col=1) · 跨 1 行 × 2 列 · 600 × 510</text>
+
+  <text x="130" y="816" font-size="14" fill="#64748b">示意图按源码中的固定尺寸绘制；布局外边距与控件间距均为 0。</text>
+</svg>

@@ -2,56 +2,111 @@
 
 ## 涉及文件
 
-| 文件 | 作用 |
-| --- | --- |
-| `server/libs/perception/hud_ocr.cpp`、`hud_ocr.hpp` | 点位解析、完整回合与点位观测判定 |
-| `server/libs/perception/perception.cpp` | 独立 OCR 观测发布与 GameState 输入组装 |
-| `config/perception.yaml` | 1440×1080 的点位 ROI 与预处理参数 |
-| `panel/clips-live.js` | 选择有效、未过期的位置证据 |
-| `panel/panel-live.js` | 发起区域视频查询 |
+- `server/libs/perception/hud_ocr.cpp`、`hud_ocr.hpp`：字段解析和可用性判断。
+- `server/libs/perception/perception.cpp`：独立 OCR 观测与 GameState 输入。
+- `config/perception.yaml`：点位 ROI。
+- `panel/clips-live.js`：点位置信度、有效期及死亡/观战过滤。
+- `panel/panel-live.js`：视频查询。
 
-## 背景与现象（S）
+## 问题
 
-2026-10-25 排查参考截图 `frame_00000244.jpg` 时发现，RapidOCR 实际已读出“A 点大道”，网页却没有推荐。热身等没有完整比分或倒计时的画面也容易遇到同类问题。
+截图里的“A 点大道”已经被 RapidOCR 识别出来，网页却没有推荐。热身画面缺少比分或倒计时，也容易出现同样情况。
 
-## 要达到的目标（T）
+我看了 `frame_00000244.jpg` 对应输出，点位不是没读到，而是因为缺少 `score_t` 被整体标成 unavailable。继续调 OCR 识别率并不能解决后面的拦截。
 
-只要当前位置可靠，就能只读查询对应教学视频；同时保留正式 GameState 对比分、回合等字段完整性的要求。
+## 修改前
 
-## 排查与根因（A）
-
-最初将 OCR 字段复用到完整回合状态链，只有通过正式回合门控才视为可用。该帧缺少 `score_t`，即使点位本身已识别，也被整体标记为 unavailable。
-
-这属于下游用途与门控条件不匹配。视频库只需要可信的区域来检索，完整 GameState 则要维护比分和回合语义，二者需要的证据集合不同。若只扩大 ROI 或换 OCR 模型，已识别的点位仍然会被原门控拦住。
-
-## 如何解决
-
-首先将“正式回合有效”和“点位观测有效”分开判断。当前组装入口的关键逻辑为：
+只读推荐复用了完整回合的判断条件。下面是原有完整回合条件：
 
 ```cpp
-const bool ocr_formal_round = ocr_ && HudOcr::hasFormalRound(ocr_out.fields);
-const bool ocr_lookup_ready = ocr_formal_round ||
-    (ocr_ && HudOcr::hasPointObservation(ocr_out.fields));
+bool HudOcr::hasFormalRound(const nlohmann::json& fields) {
+    return fields.contains("score_ct") && fields.contains("score_t") &&
+           fields.contains("round_time_left");
+}
 ```
 
-独立 `ocr_observation` 通过点位有效性决定是否发布；只有完整回合满足要求时，相关字段才进入原 GameState 聚合。
+原来的发布逻辑可简化为：
 
-该过程经历过先允许“点位+倒计时”查询的阶段，随后进一步调整为可信点位即可查询，不要求热身结束、倒计时或完整比分。最终仍保留区域词典归一化、置信度、过期以及显式死亡/观战阻断。
+```cpp
+const bool available = HudOcr::hasFormalRound(ocr_out.fields);
+// available 为 false，就把 OCR 观测设为 unavailable。
+// 点位存在，但缺一个比分字段，也进不了推荐查询。
+```
 
-同时将 1440×1080 的点位 ROI 调整为 `(60,267,200,36)`，放大 3 倍，覆盖长短区域名称。这改善了输入覆盖范围，但与解除错误门控是两个独立改动。
+对于正式 GameState，完整比分和回合信息有用途；但视频检索只是按当前位置找素材，不应该额外要求这些字段齐全。
 
-## 验证与结果（R）
+## 修改后
 
-2026-10-25 隔离 RapidOCR 验证“A 点大道”和“短梯”正常。真实存档帧回放中，无倒计时热身“短梯”自动匹配视频 1、2、9、19；切换“隧道上方”后匹配 4、5、6，道具过滤与无匹配清空也有浏览器验证。
+我把“点位观测有效”单独列出来：
 
-当天不同阶段测试计数不同，32 用例/540 断言对应 ROI 与首阶段门控修复，32 用例/541 断言对应后续区域查询与稳定性调整。两者不能拼成一个额外测试结论。完整游戏实况仍与存档回放分别验收。
+```cpp
+bool HudOcr::hasPointObservation(const nlohmann::json& fields) {
+    const auto area = fields.find("self_area");
+    return area != fields.end() && area->is_string() &&
+           !area->get_ref<const std::string&>().empty() && *area != "unknown";
+}
+```
 
-## 可以复用的经验
+在组装处分别计算两种条件：
 
-排查识别链路不能停在“模型有没有读出来”，还要检查发布、聚合、过滤与消费门控。多种业务复用同一感知输出时，应按各自需要定义最小有效证据。
+```cpp
+const bool ocr_formal_round = ocr_ &&
+    HudOcr::hasFormalRound(ocr_out.fields);
+const bool ocr_lookup_ready = ocr_formal_round ||
+    (ocr_ && HudOcr::hasPointObservation(ocr_out.fields));
 
-## 依据
+// 独立观测使用 lookup 条件。
+const json observation = {
+    {"type", "ocr_observation"},
+    {"status", ocr_lookup_ready ? "published" : "unavailable"},
+    {"formal_round", ocr_formal_round},
+    {"fields", ocr_out.fields},
+    {"confidence", ocr_out.confidence}
+    // 会话、帧序号与时间等字段省略。
+};
 
-- `docs/当前实现与双端对齐.md`：“点位OCR与Dust2跨阵营推荐”“按区域推荐、可选道具与播放稳定”。
-- `docs/道具推荐阶段验收与后续任务.md`：“当前交付规则”。
-- `server/libs/perception/perception.cpp` 的独立观测与正式回合分支。
+// 只有完整回合才继续进入原来的 GameState 字段聚合。
+if (ocr_formal_round) {
+    for (auto it = ocr_out.fields.begin(); it != ocr_out.fields.end(); ++it)
+        payload[it.key()] = it.value();
+    payload["round"] = ocr_out.fields["score_t"].get<int>() +
+                       ocr_out.fields["score_ct"].get<int>() + 1;
+}
+```
+
+published 也不等于直接播放。前端仍检查 OCR 点位置信度、有效期与显式死亡/观战状态，选点的核心条件包括：
+
+```javascript
+if (fields.hp === 0 || fields.spectating === true || fields.spectating === 1)
+  return {state: "blocked", reason: "当前为死亡或观战状态"};
+
+if (ocr?.status === "published" && typeof area === "string" &&
+    area.trim() && area !== "unknown" &&
+    Number.isFinite(confidence) && confidence >= 0.45) {
+  return {state: "ready", source: "ocr", area, input: {ocr},
+          session_id: this.session};
+}
+```
+
+点位还通过统一区域词典归一化。1440×1080 下的 ROI 同时调为 `(60,267,200,36)` 并放大 3 倍，覆盖长名称；ROI 调整改善输入覆盖，发布条件调整解决已识别结果被拦截，两者分别起作用。
+
+## 为什么这样改
+
+我没有把所有条件一起放宽，而是让两个用途各自使用需要的条件：只读检索消费可靠点位，GameState 继续要求正式回合信息。
+
+这样比分缺失只影响依赖比分的功能，不会让独立存在的当前位置一起失效。无效点位、低置信度、死亡/观战和过期数据仍然不能用于推荐。
+
+修复过程中曾保留“点位+倒计时”的条件，随后进一步取消了只读查询对热身、倒计时和比分的依赖，以上代码按最后的实现记录。
+
+## 验证
+
+2026-10-25，隔离 OCR 验证“A 点大道”“短梯”正常。无倒计时热身“短梯”存档帧回放自动命中 1、2、9、19 号视频；切到“隧道上方”命中 4、5、6，道具筛选和无匹配清空也完成浏览器验证。这轮使用真实存档帧回放。
+
+## 总结
+
+我先确认模型已经识别到点位，再沿发布和消费路径找到错误门控，最后把只读点位查询从完整 GameState 条件里拆出来。感知字段是否可用应该看具体用途，不能因为某个业务需要完整状态，就让所有下游都依赖完整状态。
+
+## 相关记录
+
+- `docs/当前实现与双端对齐.md`：点位 OCR、跨阵营推荐及后续门控调整。
+- `docs/道具推荐阶段验收与后续任务.md`：交付规则。

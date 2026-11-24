@@ -2,55 +2,96 @@
 
 ## 涉及文件
 
-| 文件 | 作用 |
-| --- | --- |
-| `client/src/uploader.cpp` | Beast WebSocket 握手、消息类型和异步发送 |
-| `server/libs/core/ws_handler.cpp` | 根据 WebSocket 消息类型分发接入数据 |
-| `server/libs/core/ingest.cpp` | 处理项目二进制协议与媒体输入 |
+- `client/src/uploader.cpp`：握手、WebSocket 消息类型、项目协议封包和发送。
+- `server/libs/core/ws_handler.cpp`：区分 Binary/Text 消息并分发。
+- `server/libs/core/ingest.cpp`：接收项目协议中的媒体数据。
 
-## 背景与现象（S）
+## 问题
 
-M0 使用 WebSocket 上传 JPEG 和 PCM。客户端能够连接服务器，也执行了发送，但服务端持续报告 `control not valid JSON`，媒体归档 `frames=0`。当时出现的 28 条 JSON 错误都来自这条错误路径。
+客户端已经连接，也执行了发送，服务器却连续报 `control not valid JSON`，归档里 `frames=0`。这次记录中的 28 条 JSON 错误都来自同一个问题：我把项目二进制帧通过 WebSocket 的 TEXT 消息发出去了。
 
-## 要达到的目标（T）
+这篇对应 M0 的 JPEG/PCM 经 WS 上传路径；后来的 WebRTC 分支已经把媒体移到 H.264/Opus 通道，WS 继续承担信令和控制。
 
-让已经按项目协议组装的二进制消息，进入服务端的二进制解析入口，最终形成真实的帧和音频归档。
+## 定位
 
-## 排查与根因（A）
+我先对照客户端发出的字节与服务器接收入口。项目消息已经有 18 字节头，后面才是 JPEG、PCM 或 Control payload。客户端封包没问题，但服务端先根据 WebSocket 消息类型决定用哪条解析路径。
 
-项目消息由固定 18 字节协议头和 payload 构成。客户端虽然发送的是字节缓冲区，但 Beast 默认将出站消息设为 TEXT。
+Beast 不会因为传入 `vector<uint8_t>` 就自动发送 Binary；缓冲区只提供字节，Text/Binary 由 WebSocket stream 的选项决定。默认 TEXT 导致服务器把协议头一起送进 JSON 解析。
 
-“缓冲区里放着二进制字节”与“WebSocket 消息类型为 BINARY”是两件事。服务端收到 TEXT 后，按文本控制消息解析，首先遇到的却是二进制协议头，自然无法得到合法 JSON。
+## 修改前
 
-```text
-客户端：项目二进制协议 → Beast 默认 TEXT
-服务器：收到 TEXT → 交给文本控制解析 → JSON 失败
-结果：数据确实发出，入口分发却已经走错
-```
-
-## 如何解决
-
-在握手成功后、开始发送队列之前，显式设置：
+按故障逻辑简化：
 
 ```cpp
-ws->binary(true);
+// 握手成功，没有设置消息类型。
+ws->async_handshake(host, path, [this](beast::error_code ec) {
+    if (ec) return onFail("handshake", ec);
+    connected = true;
+    doWrite();
+});
+
+// bytes 已经包含项目头和 payload，但这不决定 WebSocket opcode。
+ws->async_write(net::buffer(*bytes), completion);
 ```
 
-旧分帧协议中的 Control 也可以作为项目二进制帧的 payload 发送，因此应依据整体线协议确定 WebSocket 消息类型，不能只看到 payload 中存在 JSON 就判断为 TEXT。
+服务端入口可以概括为下面的分支，具体解析细节省略：
 
-修复时保留服务端校验，让类型错误继续暴露；没有通过放宽 JSON 解析或把任意字节强行转成字符串来绕过问题。
+```cpp
+if (type == WebSocketMessageType::Binary) {
+    // 解项目协议头，再按 Frame / AudioChunk / Control 分发。
+} else if (type == WebSocketMessageType::Text) {
+    // 将整条消息作为 JSON 控制消息解析。
+}
+```
 
-## 验证与结果（R）
+因此 JPEG 没有机会走到图像解码，错误在更早的入口分发就发生了。
 
-2026-10-04 的修复后真机烟测中，服务器收到 15 张 JPEG 和 15 秒音频，归档结构与计数符合预期。连接成功、发送完成、服务端解析成功和归档成功由此形成了完整的检查链。
+## 修改后
 
-这篇记录的是 M0 旧媒体传输故障。后续 WebRTC 分支使用 H.264/Opus 传媒体，WebSocket 承担信令与控制；不能把旧方案的修复理解为恢复 WS 媒体上传。
+握手完成后，在起写泵之前明确设置 Binary：
 
-## 可以复用的经验
+```cpp
+ws->async_handshake(host, path,
+    [this, stream, gen](beast::error_code ec3) {
+        if (stopping || gen != generation) return;
+        if (ec3) return onFail("handshake", ec3);
 
-排查网络协议先核对分层：TCP 是否连通、WebSocket 是否握手、消息 opcode 是否正确、业务头是否符合协议、payload 是否通过校验。上层的 JSON 错误可能由更早的消息类型错误引起。
+        ws->next_layer().expires_never();
+        ws->binary(true);
+        connected = true;
+        connected_flag = true;
 
-## 依据
+        // 之后再封包、入队和启动写泵。
+    });
+```
 
-- `docs/日志记录/day3.md`：“T1.4 Beast WS 上行”及“踩坑记录”第 1 项。
-- `client/src/uploader.cpp`：握手后的 `ws->binary(true)`。
+Control 消息的封包也沿用项目二进制协议：
+
+```cpp
+const std::string text = control.dump();
+const std::vector<uint8_t> payload(text.begin(), text.end());
+enqueue(wire::encode(
+    wire::MsgType::Control, clock::nowUs(), seq++, payload));
+```
+
+Control 的 payload 虽然是 UTF-8 JSON，外面仍包着项目协议头，所以整条 WebSocket 消息依然可以是 Binary。服务器先解头，知道类型为 Control 后，再解析内部 JSON。
+
+## 为什么这样改
+
+这里有两层类型：外层 WebSocket 的 Text/Binary，内层项目协议的 Frame/AudioChunk/Control。原来只设置了内层类型，却让外层保持默认值。
+
+`binary(true)` 修正了最外层分发，服务器终于能先拆项目头，再处理对应 payload。我保留了服务端校验，没有让 JSON 解析去容忍任意前缀，否则错误协议还会继续向后传播。
+
+设置顺序同样重要：先设置消息类型，再启动发送。对每次新建的连接都需要完成这项配置。
+
+## 验证
+
+2026-10-04 的 15 秒真机测试中，服务端收到 15 张 JPEG 和 15 秒音频，归档计数正常。验证检查到服务器落盘，而不只看客户端的写回调成功。
+
+## 总结
+
+这个问题让我区分了“传了什么字节”和“按什么协议类型发送”。网络已连接、async_write 已完成，只能说明传输走到了一部分；还要检查外层消息类型、业务头和服务端分发。JSON 报错有时不是 JSON 内容写错，而是根本不该走到 JSON 入口。
+
+## 相关记录
+
+- `docs/日志记录/day3.md`：Beast 上行、踩坑第 1 项和 INT-1 验证。

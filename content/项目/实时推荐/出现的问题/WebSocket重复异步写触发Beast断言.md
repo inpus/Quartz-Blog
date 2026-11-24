@@ -2,59 +2,104 @@
 
 ## 涉及文件
 
-| 文件 | 作用 |
-| --- | --- |
-| `client/src/uploader.cpp` | pending 队列、writing 标志、doWrite 写泵及完成回调 |
-| `client/src/uploader.hpp` | 上传器对外接口 |
+- `client/src/uploader.cpp`：pending 队列、writing 标志、doWrite 和连接代次。
+- `client/src/uploader.hpp`：上传器接口。
 
-## 背景与现象（S）
+## 问题
 
-上传器采用一个 Asio IO 线程，所有发送进入 pending 队列。开发时握手回调和入队路径都可能启动写泵，结果触发 Beast `soft_mutex` 断言，错误包含 `id_ != T::id`。
+上传器只用了一个 Asio IO 线程，仍然触发 Beast 的 `soft_mutex` 断言：`id_ != T::id`。原因是握手回调和入队路径都可能启动 `doWrite()`，前一个 `async_write` 还没完成，下一个又开始了。
 
-## 要达到的目标（T）
+## 定位
 
-对同一个 WebSocket 连接，任意时刻最多只有一个尚未完成的 `async_write`。后续消息应在前一个写完成后继续发送，不能依赖调用者自行避免重复启动。
-
-## 排查与根因（A）
-
-一个 IO 线程只保证回调代码不会同时执行，不保证异步操作的生命周期不重叠：
+我原来只考虑了“有没有两个线程同时执行”，没有把“异步操作是否还在进行”单独作为状态。
 
 ```text
-回调 A：发起 async_write 后立即返回
-回调 B：前一个写尚未完成，再次发起 async_write
-稍后：第一个写的完成回调才被调度
+回调 A：调用 async_write → 立刻返回，写操作仍在进行
+回调 B：又调用 async_write → 同一连接出现两个在途写
+之后：第一个写的 completion 才被调度
 ```
 
-因此，即使没有两个线程并行进入 `doWrite()`，仍可能在同一 stream 上挂起两个写。真正需要保护的是“在途操作”，而不只是函数执行期间的临界区。
+一个线程只能保证两段回调代码不同时运行，不能保证它们发起的异步操作不重叠。
 
-## 如何解决
+## 修改前
 
-让写泵本身具备幂等入口。当前实现的关键控制流为：
+按当时故障路径简化：
+
+```cpp
+void enqueue(std::vector<uint8_t> bytes) {
+    pending.push_back(std::move(bytes));
+    doWrite();
+}
+
+void doWrite() {
+    if (!ws || pending.empty()) return;
+    ws->async_write(net::buffer(pending.front()),
+        [this](beast::error_code ec, std::size_t) {
+            if (ec) return onFail("write", ec);
+            pending.pop_front();
+            doWrite();
+        });
+}
+```
+
+第一次写发起后，队首需要一直保留到回调完成。此时 enqueue 或握手路径再进入 doWrite，就会针对同一连接重复发起写。仅在 `async_write()` 调用前后用普通局部锁也不够，因为函数返回时异步写尚未结束。
+
+## 修改后
+
+`writing` 表示“已经有一个尚未完成的写”，由写泵自己检查。下面保留当前关键逻辑，关停关闭分支省略：
 
 ```cpp
 void doWrite() {
     if (writing) return;
     if (!ws || pending.empty() || (stopping && !flushing)) return;
     writing = true;
-    // async_write：完成后清 writing、弹出队首，再决定是否继续。
+
+    auto stream = ws;
+    auto bytes = pending.front();
+    const auto gen = generation;
+    stream->async_write(net::buffer(*bytes),
+        [this, stream, bytes, gen](beast::error_code ec, std::size_t) {
+            if (gen != generation) return;
+            writing = false;
+            if (ec) return onFail("write", ec);
+
+            if (!pending.empty()) pending.pop_front();
+            if (!pending.empty() && (connected || flushing)) {
+                doWrite();
+            }
+        });
 }
 ```
 
-只在真正发起写之前将 `writing` 置为 true。完成回调清除标志，成功后弹出已发送的队首；队列仍有数据时，由该完成回调启动下一次写。
+pending 保存的是 `shared_ptr<vector<uint8_t>>`。入队时，如果正在写就只排队；空闲时才起泵：
 
-当前代码还在回调中持有 stream 和 bytes，保证异步写期间对象、缓冲区有效，并用连接 generation 排除旧连接回调对新连接状态的影响。这些措施分别处理操作重叠、资源寿命和重连代次问题。
+```cpp
+pending.push_back(
+    std::make_shared<std::vector<uint8_t>>(std::move(bytes)));
+if (!writing) doWrite();
+```
 
-## 验证与结果（R）
+队列满需要淘汰数据时，也不能删掉正在写的队首，当前代码从 `begin() + (writing ? 1 : 0)` 选择可丢弃项。控制模式溢出则直接报连接错误。
 
-2026-10-04 日志记录此断言问题已经修复，同轮客户端真机上传和服务器归档完成。当前源码仍保留 `if (writing) return` 及相关原因注释。
+## 为什么这样改
 
-当日回归为 Windows 16/16、Linux 48/48；这些是整轮结果，不是一个专门测量写泵吞吐的基准。
+修复后，状态顺序固定为：空闲 → 设置 writing → 发起一次写 → 完成回调清 writing → 弹出队首 → 继续下一次写。无论外面多少地方调用 doWrite，只要前一个写还没结束，都不会再次进入发送。
 
-## 可以复用的经验
+这里还有两个不能省略的细节：
 
-异步状态机需要明确“谁拥有下一次操作的启动权”。对于串行发送，最清楚的安排是空闲时入队者起泵，运行后由完成回调接力。单线程执行器不能代替这套状态约束。
+- 回调按值捕获 `stream`、`bytes`，使连接和缓冲区在异步操作期间保持有效。`net::buffer` 本身不拥有数据。
+- 回调先判断 `gen`，旧连接完成的写不能清掉新连接的 writing，也不能弹出新队列的队首。generation 是处理重连代次，不是用来串行化当前连接。
 
-## 依据
+writing 只由 IO 线程访问，因此这里不需要把它改成原子变量。真正的约束是所有相关状态修改都在同一执行线程上，且写泵遵守在途标志。
 
-- `docs/日志记录/day3.md`：“踩坑记录”第 2 项。
-- `client/src/uploader.cpp`：`doWrite()`、writing 标志和异步完成回调。
+## 验证
+
+2026-10-04 修复后完成了客户端真机上传和服务端归档，当轮 Windows 16/16、Linux 48/48 测试通过。源码中保留了 writing 的幂等检查及原因注释。
+
+## 总结
+
+我通过队列加写泵保证一个连接最多有一个在途写：空闲时入队者起泵，之后由完成回调连续发送。这个问题的关键不是加多少线程锁，而是异步操作的生命周期。单 IO 线程不会自动消除异步操作重叠，缓冲区寿命和重连后的旧回调也要一起考虑。
+
+## 相关记录
+
+- `docs/日志记录/day3.md`：踩坑第 2 项。

@@ -2,64 +2,133 @@
 
 ## 涉及文件
 
-| 文件 | 作用 |
-| --- | --- |
-| `panel/clips-live.js` | 观测序号、来源优先级与有效期 |
-| `panel/panel-live.js` | 稳定位置、手持状态、查询版本与结果去重 |
-| `panel/panel.js` | 播放器与副屏接线 |
-| `tools/test_panel_live.mjs` | 漏识别、双帧确认、来源切换、重复结果与迟到响应回归 |
+- `panel/clips-live.js`：观测去重、来源选择和有效期。
+- `panel/panel-live.js`：稳定位置、道具确认、请求版本和结果签名。
+- `panel/panel.js`：播放器接线。
+- `tools/test_panel_live.mjs`：漏识别、重复帧、换区和迟到响应测试。
 
-## 背景与现象（S）
+## 问题
 
-用户站在同一区域时，OCR 仍可能单帧漏识别、低置信度或误读另一区域，OCR 与 VLM 的可用性也可能交替。如果每次输入变化都清空或重建视频，教学片段就会闪切、重新加载或从头播放。
+人还站在同一区域，视频却可能闪一下、重新加载或从头开始。OCR 单帧漏识别、低置信度、误读区域，以及 OCR/VLM 之间切换，都会引起输入变化，但这些变化不一定意味着应该更换视频。
 
-## 要达到的目标（T）
+我把问题拆成三层：观测怎么确认、请求结果是否还有效、播放器是否需要更新。
 
-同一区域持续播放，可靠换区后更新；断线、停止、过期、明确死亡/观战或无匹配时清空。稳定播放不能依赖无限保留旧结果。
+## 修改前
 
-## 排查与根因（A）
-
-原流程没有充分区分三个层次：感知观测是否变化、业务上的区域/道具是否变化、最终视频列表是否变化。一个输入字段波动就可能一路传到播放器重建。
-
-异步查询还带来额外风险：旧区域请求可能在新区域请求之后返回，或者在清空后才返回。如果直接渲染，旧视频会重新出现。因此修复需要覆盖状态确认、媒体幂等更新和异步结果有效性。
-
-## 如何解决
-
-### 先得到稳定业务状态
-
-首次有效点位可以建立状态。已有位置切换到另一区域时，要求两个不同帧的有效证据确认；同一帧被两个模型读取，不能算两帧。定时 tick 或重复消息也不能凑确认次数。
-
-短时漏识别保留最近有效位置，最多 4 秒。OCR/VLM 来源切换而区域相同时，继续沿用业务位置。手持道具也使用不同 OCR 帧确认，库存列表不作为当前手持证据；跨会话清空旧状态。
-
-### 相同列表不动播放器
-
-`show()` 根据视频 ID 与 URL 计算可见结果签名：
+原有问题可以概括为下面的直接驱动方式，函数名为示意：
 
 ```javascript
-const signature = JSON.stringify(visible.map(c => [c.clip_id, c.url]));
-if (signature === this.signature) return;
-this.signature = signature;
-this.render(visible, recommendations);
+async function onObservation(observation) {
+  if (!observation.area) {
+    clearVideos();
+    return;
+  }
+  const clips = await queryClips(observation.area);
+  renderVideos(clips);  // 相同结果也可能重建元素、重新设置 src。
+}
 ```
 
-即使周期查询再次返回相同结果，也不会重设媒体源。播放器自身 loop 到开头是正常循环，需要和重新加载区别观察。
+它有三个后果：漏一帧就清空；错一帧就换区；相同列表反复设置媒体源。若 A 区请求慢、B 区请求快，A 还可能在 B 之后返回，把画面换回旧区域。
 
-### 拦截失效请求
+## 修改后
 
-查询失效时增加版本号并通过 AbortController 取消旧请求。响应回来后仍检查版本；即使取消未及时生效，旧版本结果也无权渲染。停止会话另记录身份，防止迟到观测再次触发查询。
+### 1. 用不同帧确认换区
 
-## 验证与结果（R）
+第一次可靠位置可以建立状态；已有位置切到另一区域时，先记 candidate，两个不同帧确认后才更新 stable。当前 `selectStable()` 的换区分支如下：
 
-2026-10-25 的 105 帧回放插入漏识别和低置信度帧，浏览器连续约 21.939 秒没有额外 `loadeddata` 换片事件，视频持续播放；换区、道具筛选、无匹配清空均有记录。
+```javascript
+const row = this.positions[selected.source];
+const evidence = row.message.seq;
+const next = {...selected, seenAt: row.received};
 
-2026-10-26 整轮前端 25 项测试通过，覆盖相同结果不重载、OCR 优先、媒体停止清空、晚到响应和服务端口解析。25 是当轮前端总数，并非本问题单独的用例数量。
+if (!this.stable || selected.area === this.stable.area ||
+    now - this.stable.seenAt >= this.positions.maxAgeMs) {
+  this.stable = next;
+  this.candidate = null;
+} else {
+  if (this.candidate?.area !== selected.area ||
+      now - this.candidate.seenAt >= 2500) {
+    this.candidate = {
+      area: selected.area, evidence, seenAt: row.received, count: 1
+    };
+  } else if (evidence !== this.candidate.evidence) {
+    this.candidate = {...this.candidate, evidence,
+      seenAt: row.received, count: this.candidate.count + 1};
+  }
+  if (this.candidate.count >= 2) {
+    this.stable = next;
+    this.candidate = null;
+  }
+}
+```
 
-## 可以复用的经验
+不能按 tick 次数增加 count，因为一次观测可能被重复读取；OCR 和 VLM 读取同一帧也只能算一次证据。seq 用来区分帧，candidate 超过 2.5 秒则重新确认。
 
-高频感知结果不应直接驱动昂贵 UI 更新。先把噪声观测收敛为稳定状态，再按最终业务结果做幂等渲染；异步响应必须携带有效期或版本约束，不能认为“最后返回的就是最新结果”。
+单帧漏识别时，最近有效位置最多保留 4 秒。确认死亡/观战、停止、断线或超期仍要清空。OCR/VLM 来源切换但 area 相同，不算换区。手持道具也按不同 OCR 帧确认，不能用库存栏代替当前选中道具。
 
-## 依据
+### 2. 相同结果不操作播放器
 
-- `docs/道具推荐阶段验收与后续任务.md`：“稳定性”及交付规则。
-- `docs/双路实时识别与网页推荐验收.md`：“网页推荐”。
-- `panel/panel-live.js` 的 selectStable、selectHeld、show、invalidate 与 query。
+`show()` 比较当前可见列表的 ID 和 URL：
+
+```javascript
+show(clips, recommendations = []) {
+  const visible = clips.slice(0, this.limit);
+  const signature = JSON.stringify(visible.map(c => [c.clip_id, c.url]));
+  if (signature === this.signature) return;
+  this.signature = signature;
+  this.render(visible, recommendations);
+}
+```
+
+10 秒周期刷新或重复观测即使触发查询，只要最终列表没变，也不重新 render。签名保留列表顺序，因此槽位顺序变化仍然会触发更新。
+
+### 3. 请求取消与版本校验一起用
+
+失效时取消请求、递增版本并清空结果：
+
+```javascript
+invalidate() {
+  this.version++;
+  this.pending?.abort();
+  this.pending = null;
+  this.key = "";
+  this.show([]);
+}
+```
+
+发起查询时保存本次版本，结果回来后再判断。下面是当前逻辑的压缩写法：
+
+```javascript
+const current = ++this.version;
+const controller = new AbortController();
+this.pending?.abort();
+this.pending = controller;
+
+// 请求使用 signal: controller.signal；此处省略 T/CT 两路查询和合并。
+const results = await requestResults(controller.signal);
+if (current !== this.version) return;
+this.show(mergeClips(results));
+```
+
+`requestResults`、`mergeClips` 是为了缩短示例抽出的名字，实际实现在 query 内。采集停止还会记录 stoppedSessions，拦住停止会话迟到的观测，防止它再发起一轮新查询。
+
+## 为什么这样改
+
+双帧确认处理观测噪声，4 秒有效期限制旧状态能保留多久，结果签名避免重复操作媒体源，版本号处理异步响应乱序。这几层不能互相替代。
+
+AbortController 只负责尽量停止无用请求；请求可能已经完成或结果已进入后续代码，所以是否能修改 UI 最终由版本号决定。播放器 loop 自己回到开头则是正常循环，要和设置 src 引起的重载分别观察。
+
+## 验证
+
+2026-10-25，105 帧回放中插入漏识别和低置信度帧，浏览器连续约 21.939 秒没有额外 loadeddata 换片事件。另验证了换区、道具过滤、无匹配和失效清空。
+
+2026-10-26 的整轮前端 25 项测试包含相同结果不重载、迟到响应、媒体停止、OCR 优先和端口解析，均通过。
+
+## 总结
+
+我没有直接拿每条识别结果控制播放器，而是先确认稳定位置和道具，再查询，最后比较真正要显示的视频列表。异步结果必须证明自己仍属于当前版本，才能更新页面。这样既减少误识别闪切，也避免相同视频反复重载和旧请求回填。
+
+## 相关记录
+
+- `docs/道具推荐阶段验收与后续任务.md`：播放稳定性。
+- `docs/双路实时识别与网页推荐验收.md`：前端验证。
